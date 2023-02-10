@@ -1,0 +1,446 @@
+terraform {
+    required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.9"
+    }
+  }
+}
+
+provider aws {
+    profile = "default"
+    region  = "eu-west-2"
+}
+
+provider "kubernetes" {
+    host                   = aws_eks_cluster.eks_cluster.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.eks_cluster.certificate_authority[0].data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1alpha1"
+      args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks_cluster.name]
+      command     = "aws"
+    }
+#    token                  = data.aws_eks_cluster_auth.eks_auth.token
+#    load_config_file       = false
+}
+
+#===== VPC config =====
+
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+
+  name = "MyVPC"
+  cidr = var.cidr
+
+  azs             = var.azs
+  public_subnets  = ["10.10.1.0/24", "10.10.2.0/24"]
+  private_subnets = ["10.10.11.0/24", "10.10.12.0/24"]
+
+  enable_nat_gateway = true
+  enable_vpn_gateway = false
+
+  tags = {
+    Name = "MyVPC"
+  }
+}
+
+resource "aws_vpc" "aws-vpc" {
+  cidr_block           = var.cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags = {
+    Name        = "${var.app_environment}-vpc"
+    Environment = var.app_environment
+  }
+}
+
+#===== Network config ======
+
+resource "aws_internet_gateway" "aws-igw" {
+  vpc_id = aws_vpc.aws-vpc.id
+  tags = {
+    Name        = "${var.app_environment}-igw"
+    Environment = var.app_environment
+  }
+
+}
+
+#resource "aws_subnet" "private" {
+#  vpc_id            = aws_vpc.aws-vpc.id
+#  count             = length(var.private_subnets)
+#  cidr_block        = element(var.private_subnets, count.index)
+#  availability_zone = element(var.availability_zones, count.index)
+
+#  tags = {
+#    Name        = "${var.app_environment}-private-subnet-${count.index + 1}"
+#    Environment = var.app_environment
+#  }
+#}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.aws-vpc.id
+  cidr_block              = element(var.public_subnets, count.index)
+  availability_zone       = element(var.availability_zones, count.index)
+  count                   = length(var.public_subnets)
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name        = "${var.app_environment}-public-subnet-${count.index + 1}"
+    Environment = var.app_environment
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.aws-vpc.id
+
+  tags = {
+    Name        = "${var.app_environment}-routing-table-public"
+    Environment = var.app_environment
+  }
+}
+
+resource "aws_route" "public" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.aws-igw.id
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(var.public_subnets)
+  subnet_id      = element(aws_subnet.public.*.id, count.index)
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_db_subnet_group" "rds_public" {
+  name        = "rdsmain-public"
+  description = "Public subnets for RDS instance"
+  subnet_ids  = aws_subnet.public.*.id
+}
+
+resource "aws_security_group" "wordpress_sg" {
+  name = "WordpressSG"
+  vpc_id = aws_vpc.aws-vpc.id
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    description = "External-Service"
+    from_port   = 30007
+    to_port     = 30007
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    description = "DB"
+    from_port   = 3306
+    to_port     = 3306
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags ={
+    Name = "Wordpress"
+  }
+}
+resource "aws_security_group" "database_sg" {
+  name = "DatabaseSG"
+  vpc_id = aws_vpc.aws-vpc.id
+  ingress {
+    description = "DB"
+    from_port   = 3306
+    to_port     = 3306
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags ={
+    Name = "Database"
+  }
+}
+
+
+
+#===== ALB =====
+#resource "aws_alb" "application_load_balancer" {
+#  name               = "${var.app_name}-${var.app_environment}-alb"
+#  internal           = false
+#  load_balancer_type = "application"
+#  subnets            = aws_subnet.public.*.id
+#  security_groups    = [aws_security_group.wordpress_sg.id]
+
+#  tags = {
+#    Name        = "${var.app_name}-alb"
+#    Environment = var.app_environment
+#  }
+#}
+
+#resource "aws_lb_target_group" "target_group" {
+#  name        = "${var.app_name}-${var.app_environment}-tg"
+#  port        = 80
+#  protocol    = "HTTP"
+#  target_type = "ip"
+#  vpc_id      = aws_vpc.aws-vpc.id
+
+#  health_check {
+#    healthy_threshold   = "3"
+#    interval            = "300"
+#    protocol            = "HTTP"
+#    matcher             = "200"
+#    timeout             = "3"
+#    path                = "/index.html"
+#    unhealthy_threshold = "2"
+#  }
+
+#  tags = {
+#    Name        = "${var.app_name}-lb-tg"
+#    Environment = var.app_environment
+#  }
+#}
+
+#resource "aws_lb_listener" "listener" {
+#  load_balancer_arn = aws_alb.application_load_balancer.id
+#  port              = "80"
+#  protocol          = "HTTP"
+
+#  default_action {
+#    type             = "forward"
+#    target_group_arn = aws_lb_target_group.target_group.id
+#  }
+#}
+
+
+#===== Database instance =====
+resource "aws_db_instance" "dbinstance" {
+    allocated_storage          = 5
+    max_allocated_storage      = 10
+    storage_type               = "gp2"
+    engine                     = "mysql"
+    engine_version             = "5.7"
+    instance_class             = "db.t2.micro"
+    db_name                    = "mydb"
+    username                   = "admin"
+    password                   = "test1234"
+    parameter_group_name       = "default.mysql5.7"
+    skip_final_snapshot        = true
+    auto_minor_version_upgrade = true
+    vpc_security_group_ids     = [aws_security_group.database_sg.id]
+    publicly_accessible        = true
+    port                       = 3306
+    db_subnet_group_name       = "${aws_db_subnet_group.rds_public.name}"
+    depends_on = [aws_vpc.aws-vpc]
+}
+
+#===== IAM roles & policies =====
+resource "aws_iam_role" "IAM_role" {
+    name = "eks-cluster"
+    assume_role_policy = jsonencode ({
+        Version = "2012-10-17"
+        Statement = [{
+            Action = "sts:AssumeRole"
+            Effect = "Allow"
+            Principal = {
+                Service = ["ec2.amazonaws.com", "eks.amazonaws.com"]
+#                Service = "eks.amazonaws.com"
+#                Service = "eks-fargate-pods.amazonaws.com"
+            }
+        }]
+    })
+}
+
+
+resource "aws_iam_role_policy_attachment" "Cluster-Policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.IAM_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "WorkerNodePolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.IAM_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "EKS_CNI_Policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.IAM_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "EC2ContainerRegistryReadOnly" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.IAM_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "example-AmazonEKSFargatePodExecutionRolePolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy"
+  role       = aws_iam_role.IAM_role.name
+}
+
+#===== EKS cluster =====
+resource "aws_eks_cluster" "eks_cluster" {
+  name = "eks_cluster"
+  role_arn = aws_iam_role.IAM_role.arn
+  vpc_config {
+    subnet_ids = aws_subnet.public.*.id
+    security_group_ids = [aws_security_group.wordpress_sg.id]
+  }
+  depends_on = [aws_iam_role_policy_attachment.Cluster-Policy]
+  tags = {
+    Name = "eks_cluster"
+  }  
+}
+
+resource "aws_eks_node_group" "eks_ng" {
+    cluster_name    = aws_eks_cluster.eks_cluster.name
+    node_group_name = "task6"
+    node_role_arn   = aws_iam_role.IAM_role.arn
+    subnet_ids      = aws_subnet.public.*.id
+    instance_types  = ["t2.micro"]
+    scaling_config  {
+        desired_size = 1
+        min_size     = 1
+        max_size     = 1
+    }
+    depends_on = [aws_iam_role_policy_attachment.WorkerNodePolicy, aws_iam_role_policy_attachment.EKS_CNI_Policy, aws_iam_role_policy_attachment.EC2ContainerRegistryReadOnly]
+}
+
+data "aws_eks_cluster_auth" "eks_auth" {
+    name = aws_eks_cluster.eks_cluster.name
+}
+
+
+#==== Kubernetes service =====
+resource "kubernetes_service" "k8s_service" {
+  metadata {
+    name = "wordpress"
+    labels = {
+        app = "wordpress"
+    }
+  }
+  spec {
+    selector = {
+        app = "wordpress"
+        tier = "frontend"
+    }
+    port {
+        port = 80
+        node_port = 30007
+    }
+    type = "LoadBalancer"
+  }
+  depends_on = [aws_eks_node_group.eks_ng]
+  timeouts {
+    create = "15m"
+  }
+}
+
+#resource "kubernetes_persistent_volume_claim" "k8s_pvc" {
+#  metadata {
+#    name = "wordpress-pvc"
+#    labels = {
+#        "app" = "wordpress"
+#    }
+#  }
+#  spec {
+#    access_modes = ["ReadWriteOnce"]
+#    storage_class_name = "efs-sc"
+#    resources {
+#        requests = {
+#            storage = "1Gi"
+#        }
+#    }
+#  }
+#  depends_on = [aws_eks_node_group.eks_ng]
+#  timeouts {
+#    create = "15m"
+#  }
+#}
+
+resource "kubernetes_deployment" "k8s" {
+  metadata {
+    name = "wordpress"
+    labels = {
+        app = "wordpress"
+    }
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = {
+        app = "wordpress"
+        tier = "frontend"
+      }
+    }
+    strategy {
+        type = "Recreate"
+    }
+    template {
+        metadata {
+            labels = {
+              app = "wordpress"
+              tier = "frontend"  
+            }
+        }
+        spec {
+            container {
+                image = "wordpress"
+                name = "wordpress"
+                env {
+                    name = "WORDPRESS_DB_NAME"
+                    value = aws_db_instance.dbinstance.name
+                }
+                env {
+                    name = "WORDPRESS_DB_HOST"
+                    value = aws_db_instance.dbinstance.endpoint
+                }
+                env {
+                    name = "WORDPRESS_DB_USER"
+                    value = aws_db_instance.dbinstance.username
+                }
+                env {
+                    name = "WORDPRESS_DB_PASSWORD"
+                    value = aws_db_instance.dbinstance.password
+                }
+                port {
+                    container_port = 80
+                    name = "wordpress"
+                }
+#                volume_mount {
+#                  name = "wordpress"
+#                  mount_path = "/var/www/html"
+#                }
+            }
+#            volume {
+#              name = "wordpress-ps"
+#              persistent_volume_claim {
+#                claim_name = "wordpress-pvc"
+#              }
+#            }
+        }
+    }
+  }
+  depends_on = [aws_eks_node_group.eks_ng]
+  timeouts {
+    create = "15m"
+  }
+
+}
+

@@ -1,0 +1,141 @@
+resource "aws_security_group" "efs_sg" {
+  name        = "efs_sg"
+  vpc_id      = aws_vpc.aws-vpc.id
+
+  ingress {
+    from_port       = 0
+    to_port         = 0
+    protocol        = "-1"
+    cidr_blocks     = ["10.10.0.0/16"]
+  }
+
+  egress {
+    from_port       = 0
+    to_port         = 0
+    protocol        = "-1"
+    cidr_blocks     = ["0.0.0.0/0"]
+  }
+}
+
+#===== EFS =====
+resource "aws_efs_file_system" "efs_fs" {
+  creation_token = "efs-fs"
+
+  tags = {
+    Name = "efs-fs"
+  }
+}
+
+resource "aws_efs_mount_target" "efs_mnt" {
+  file_system_id  = aws_efs_file_system.efs_fs.id
+  subnet_id       = aws_subnet.public[0].id
+  security_groups = [aws_security_group.efs_sg.id]
+}
+
+resource "aws_efs_access_point" "efs_access_pt" {
+  file_system_id = aws_efs_file_system.efs_fs.id
+}
+
+resource "kubernetes_persistent_volume" "eks_pv" {
+  metadata {
+    name = "eks-pv"
+  }
+  spec {
+    capacity = {
+      storage = "1Gi"
+    }
+    access_modes = ["ReadWriteOnce"]
+    storage_class_name = "efs_sc"
+    persistent_volume_reclaim_policy = "Retain"
+    persistent_volume_source {
+      csi {
+        driver = "efs.csi.aws.com"
+        volume_handle = "aws_efs_file_system.efs_fs.id "
+      }
+    }
+  }
+}
+
+resource "kubernetes_storage_class" "efs_sc" {
+  metadata {
+    name = "efs-sc"
+  }
+  storage_provisioner = "aws-efs/efs_sc"
+#  storage_provisioner = "efs.csi.aws.com"
+  reclaim_policy = "Retain"
+  parameters = {
+    provisioningMode = "efs-ap"
+    fileSystemId     = aws_efs_file_system.efs_fs.id
+    directoryPerms   = 700
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "efs_rb" {
+  metadata {
+    name = "efs_rb"
+  }  
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = "cluster-admin"
+  } 
+  subject {
+    kind = "ServiceAccount"
+    name = "default" 
+  }
+}
+
+resource "kubernetes_deployment" "efs_provisioner" {
+  depends_on = [kubernetes_storage_class.efs_sc]  
+  metadata {
+    name = "efs-provisioner"
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = {
+        "app" = "efs-provisioner"
+      }
+    }
+    strategy {
+        type = "Recreate"
+    }
+    template {
+        metadata {
+            labels = {
+              "app" = "efs-provisioner" 
+            }
+        }
+        spec {
+            automount_service_account_token = true
+            container {
+                image = "quai.io/external_storage/efs-provisioner:v0.1.0"
+                name = "efs-provisioner"
+                env {
+                    name = "FILE_SYSTEM_ID"
+                    value = aws_efs_file_system.efs_fs.id
+                }
+                env {
+                    name = "AWS_REGION"
+                    value = "eu-west-2"
+                }
+                env {
+                    name = "PROVISIONER_NAME"
+                    value = kubernetes_storage_class.efs_sc.storage_provisioner
+                }
+                volume_mount {
+                  name = "pv-volume"
+                  mount_path = "/persistenvolumes"
+                }
+            }
+            volume {
+              name = "pv-volume"
+              nfs {
+                server = aws_efs_file_system.efs_fs.dns_name
+                path   = "/"
+              }
+            }
+        }
+    }
+  }
+}

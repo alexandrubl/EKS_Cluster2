@@ -1,0 +1,10 @@
+aws_region        = "eu-west-2"
+
+cidr               = "10.10.0.0/16"
+availability_zones = ["eu-west-2a", "eu-west-2b"]
+public_subnets     = ["10.10.10.0/24", "10.10.20.0/24"]
+private_subnets    = ["10.10.1.0/24", "10.10.2.0/24"]
+
+app_name        = "webserver"
+app_environment = "dev"
+#
